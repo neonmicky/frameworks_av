@@ -321,6 +321,11 @@ status_t Camera3Device::initializeCommonLocked() {
         mTimestampOffset = getMonoToBoottimeOffset();
     }
 
+#ifdef TARGET_CAMERA_BOOTTIME_TIMESTAMP
+    // Always calculate the offset if requested
+    mTimestampOffset = getMonoToBoottimeOffset();
+#endif
+
     // Will the HAL be sending in early partial result metadata?
     camera_metadata_entry partialResultsCount =
             mDeviceInfo.find(ANDROID_REQUEST_PARTIAL_RESULT_COUNT);
@@ -627,9 +632,6 @@ ssize_t Camera3Device::getJpegBufferSize(uint32_t width, uint32_t height) const 
             (maxJpegResolution.width * maxJpegResolution.height);
     ssize_t jpegBufferSize = scaleFactor * (maxJpegBufferSize - kMinJpegBufferSize) +
             kMinJpegBufferSize;
-    if (jpegBufferSize > maxJpegBufferSize) {
-        jpegBufferSize = maxJpegBufferSize;
-    }
 
     return jpegBufferSize;
 }

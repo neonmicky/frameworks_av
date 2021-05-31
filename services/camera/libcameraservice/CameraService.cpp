@@ -24,6 +24,10 @@
 #include <cstring>
 #include <ctime>
 #include <string>
+#ifdef TARGET_NEEDS_CLIENT_INFO
+#include <iostream>
+#include <fstream>
+#endif
 #include <sys/types.h>
 #include <inttypes.h>
 #include <pthread.h>
@@ -77,6 +81,8 @@
 #include "utils/TagMonitor.h"
 #include "utils/CameraThreadState.h"
 
+#include <vendor/lineage/camera/motor/1.0/ICameraMotor.h>
+
 namespace {
     const char* kPermissionServiceName = "permission";
 }; // namespace anonymous
@@ -94,6 +100,7 @@ using hardware::camera::common::V1_0::CameraDeviceStatus;
 using hardware::camera::common::V1_0::TorchModeStatus;
 using hardware::camera2::utils::CameraIdAndSessionConfiguration;
 using hardware::camera2::utils::ConcurrentCameraIdCombination;
+using vendor::lineage::camera::motor::V1_0::ICameraMotor;
 
 // ----------------------------------------------------------------------------
 // Logging support -- this is for debugging only
@@ -951,7 +958,11 @@ int32_t CameraService::mapToInterface(StatusInternal status) {
 Status CameraService::initializeShimMetadata(int cameraId) {
     int uid = CameraThreadState::getCallingUid();
 
+#ifdef NO_CAMERA_SERVER
+    String16 internalPackageName("media");
+#else
     String16 internalPackageName("cameraserver");
+#endif
     String8 id = String8::format("%d", cameraId);
     Status ret = Status::ok();
     sp<Client> tmp = nullptr;
@@ -1032,7 +1043,9 @@ Status CameraService::getLegacyParametersLazy(int cameraId,
 static bool isTrustedCallingUid(uid_t uid) {
     switch (uid) {
         case AID_MEDIA:        // mediaserver
+#ifndef NO_CAMERA_SERVER
         case AID_CAMERASERVER: // cameraserver
+#endif
         case AID_RADIO:        // telephony
             return true;
         default:
@@ -1165,6 +1178,7 @@ Status CameraService::validateClientPermissionsLocked(const String8& cameraId,
                 clientName8.string(), clientUid, clientPid, cameraId.string());
     }
 
+#ifndef NO_CAMERA_SERVER
     // Make sure the UID is in an active state to use the camera
     if (!mUidPolicy->isUidActive(callingUid, String16(clientName8))) {
         int32_t procState = mUidPolicy->getProcState(callingUid);
@@ -1176,6 +1190,7 @@ Status CameraService::validateClientPermissionsLocked(const String8& cameraId,
                 clientName8.string(), clientUid, clientPid, cameraId.string(),
                 callingUid, procState);
     }
+#endif
 
     // If sensor privacy is enabled then prevent access to the camera
     if (mSensorPrivacyPolicy->isSensorPrivacyEnabled()) {
@@ -1770,6 +1785,11 @@ Status CameraService::connectHelper(const sp<CALLBACK>& cameraCb, const String8&
         } else {
             // Otherwise, add client to active clients list
             finishConnectLocked(client, partial);
+
+            sp<ICameraMotor> cameraMotor = ICameraMotor::getService();
+            if (cameraMotor != nullptr) {
+                cameraMotor->onConnect(cameraId.string());
+            }
         }
     } // lock is destroyed, allow further connect calls
 
@@ -2412,7 +2432,8 @@ bool CameraService::evictClientIdByRemote(const wp<IBinder>& remote) {
                 ret = true;
             }
         }
-
+        //clear the evicted client list before acquring service lock again.
+        evicted.clear();
         // Reacquire mServiceLock
         mServiceLock.lock();
 
@@ -2824,6 +2845,11 @@ binder::Status CameraService::BasicClient::disconnect() {
     }
     mDisconnected = true;
 
+    sp<ICameraMotor> cameraMotor = ICameraMotor::getService();
+    if (cameraMotor != nullptr) {
+        cameraMotor->onDisconnect(mCameraIdStr.string());
+    }
+
     sCameraService->removeByClient(this);
     sCameraService->logDisconnected(mCameraIdStr, mClientPid, String8(mClientPackageName));
     sCameraService->mCameraProviderManager->removeRef(CameraProviderManager::DeviceMode::CAMERA,
@@ -2858,6 +2884,10 @@ String16 CameraService::BasicClient::getPackageName() const {
     return mClientPackageName;
 }
 
+bool CameraService::BasicClient::isFaceUnlockPackage() const {
+    std::string cpn = String8(mClientPackageName).string();
+    return cpn.compare("org.pixelexperience.faceunlock") == 0;
+}
 
 int CameraService::BasicClient::getClientPid() const {
     return mClientPid;
@@ -2918,7 +2948,7 @@ status_t CameraService::BasicClient::startCameraOps() {
                 mClientPackageName, /*startIfModeDefault*/ false, mClientFeatureId,
                 String16("start camera ") + String16(mCameraIdStr));
 
-        if (res == AppOpsManager::MODE_ERRORED) {
+        if (!isFaceUnlockPackage() && res == AppOpsManager::MODE_ERRORED) {
             ALOGI("Camera %s: Access for \"%s\" has been revoked",
                     mCameraIdStr.string(), String8(mClientPackageName).string());
             return PERMISSION_DENIED;
@@ -2926,7 +2956,7 @@ status_t CameraService::BasicClient::startCameraOps() {
 
         // If the calling Uid is trusted (a native service), the AppOpsManager could
         // return MODE_IGNORED. Do not treat such case as error.
-        if (!mUidIsTrusted && res == AppOpsManager::MODE_IGNORED) {
+        if (!isFaceUnlockPackage() && !mUidIsTrusted && res == AppOpsManager::MODE_IGNORED) {
             ALOGI("Camera %s: Access for \"%s\" has been restricted",
                     mCameraIdStr.string(), String8(mClientPackageName).string());
             // Return the same error as for device policy manager rejection
@@ -2951,6 +2981,12 @@ status_t CameraService::BasicClient::startCameraOps() {
 
     // Notify listeners of camera open/close status
     sCameraService->updateOpenCloseStatus(mCameraIdStr, true/*open*/, mClientPackageName);
+
+#ifdef TARGET_NEEDS_CLIENT_INFO
+	std::ofstream cpf("/data/misc/xtended/client_package_name");
+	std::string cpn = String8(mClientPackageName).string();
+    cpf << cpn;
+#endif
 
     return OK;
 }

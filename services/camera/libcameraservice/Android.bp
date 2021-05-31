@@ -18,6 +18,12 @@
 
 cc_library_shared {
     name: "libcameraservice",
+    defaults: [
+        "no_cameraserver_defaults",
+        "qti_camera_device_defaults",
+        "needs_camera_boottime",
+        "target_camera_needs_client_info_defaults",
+    ],
 
     // Camera service source
 
@@ -127,7 +133,8 @@ cc_library_shared {
         "android.hardware.camera.device@3.3",
         "android.hardware.camera.device@3.4",
         "android.hardware.camera.device@3.5",
-        "android.hardware.camera.device@3.6"
+        "android.hardware.camera.device@3.6",
+        "vendor.lineage.camera.motor@1.0"
     ],
 
     static_libs: [
@@ -157,6 +164,4 @@ cc_library_shared {
         "-Werror",
         "-Wno-ignored-qualifiers",
     ],
-
 }
-

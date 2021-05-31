@@ -279,6 +279,13 @@ protected:
 
     void postFillThisBuffer(BufferInfo *info);
 
+    void maybePostExtraOutputMetadataBufferRequest() {
+        if (!mPendingExtraOutputMetadataBufferRequest) {
+            (new AMessage(kWhatSubmitExtraOutputMetadataBuffer, mCodec))->post();
+            mPendingExtraOutputMetadataBufferRequest = true;
+        }
+    }
+
 private:
     // Handles an OMX message. Returns true iff message was handled.
     bool onOMXMessage(const sp<AMessage> &msg);
@@ -301,6 +308,8 @@ private:
     virtual bool onOMXFrameRendered(int64_t mediaTimeUs, nsecs_t systemNano);
 
     void getMoreInputDataIfPossible();
+
+    bool mPendingExtraOutputMetadataBufferRequest;
 
     DISALLOW_EVIL_CONSTRUCTORS(BaseState);
 };
@@ -555,6 +564,7 @@ ACodec::ACodec()
       mShutdownInProgress(false),
       mExplicitShutdown(false),
       mIsLegacyVP9Decoder(false),
+      mIsLowLatency(false),
       mEncoderDelay(0),
       mEncoderPadding(0),
       mRotationDegrees(0),
@@ -2237,6 +2247,12 @@ status_t ACodec::configureCodec(
             }
             err = setupG711Codec(encoder, sampleRate, numChannels);
         }
+    } else if (!strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_OPUS)) {
+        int32_t numChannels = 1, sampleRate = 48000;
+        if (msg->findInt32("channel-count", &numChannels) &&
+            msg->findInt32("sample-rate", &sampleRate)) {
+            err = setupOpusCodec(encoder, sampleRate, numChannels);
+        }
     } else if (!strcasecmp(mime, MEDIA_MIMETYPE_AUDIO_FLAC)) {
         // numChannels needs to be set to properly communicate PCM values.
         int32_t numChannels = 2, sampleRate = 44100, compressionLevel = -1;
@@ -2409,6 +2425,7 @@ status_t ACodec::setLowLatency(int32_t lowLatency) {
     if (err != OK) {
         ALOGE("decoder can not set low-latency to %d (err %d)", lowLatency, err);
     }
+    mIsLowLatency = (lowLatency && err == OK);
     return err;
 }
 
@@ -3108,6 +3125,26 @@ status_t ACodec::setupG711Codec(bool encoder, int32_t sampleRate, int32_t numCha
 
     return setupRawAudioFormat(
             kPortIndexInput, sampleRate, numChannels);
+}
+
+status_t ACodec::setupOpusCodec(bool encoder, int32_t sampleRate, int32_t numChannels) {
+    if (encoder) {
+        return INVALID_OPERATION;
+    }
+    OMX_AUDIO_PARAM_ANDROID_OPUSTYPE def;
+    InitOMXParams(&def);
+    def.nPortIndex = kPortIndexInput;
+    status_t err = mOMXNode->getParameter(
+            (OMX_INDEXTYPE)OMX_IndexParamAudioAndroidOpus, &def, sizeof(def));
+    if (err != OK) {
+        ALOGE("setupOpusCodec(): Error %d getting OMX_IndexParamAudioAndroidOpus parameter", err);
+        return err;
+    }
+    def.nSampleRate = sampleRate;
+    def.nChannels = numChannels;
+    err = mOMXNode->setParameter(
+           (OMX_INDEXTYPE)OMX_IndexParamAudioAndroidOpus, &def, sizeof(def));
+    return err;
 }
 
 status_t ACodec::setupFlacCodec(
@@ -5294,21 +5331,20 @@ status_t ACodec::getPortFormat(OMX_U32 portIndex, sp<AMessage> &notify) {
                             err = mOMXNode->getParameter(
                                     (OMX_INDEXTYPE)OMX_IndexParamAudioAndroidAacDrcPresentation,
                                     &presentation, sizeof(presentation));
-                            if (err != OK) {
-                                return err;
+                            if (err == OK) {
+                                notify->setInt32("aac-encoded-target-level",
+                                                 presentation.nEncodedTargetLevel);
+                                notify->setInt32("aac-drc-cut-level", presentation.nDrcCut);
+                                notify->setInt32("aac-drc-boost-level", presentation.nDrcBoost);
+                                notify->setInt32("aac-drc-heavy-compression",
+                                                 presentation.nHeavyCompression);
+                                notify->setInt32("aac-target-ref-level",
+                                                 presentation.nTargetReferenceLevel);
+                                notify->setInt32("aac-drc-effect-type", presentation.nDrcEffectType);
+                                notify->setInt32("aac-drc-album-mode", presentation.nDrcAlbumMode);
+                                notify->setInt32("aac-drc-output-loudness",
+                                                 presentation.nDrcOutputLoudness);
                             }
-                            notify->setInt32("aac-encoded-target-level",
-                                             presentation.nEncodedTargetLevel);
-                            notify->setInt32("aac-drc-cut-level", presentation.nDrcCut);
-                            notify->setInt32("aac-drc-boost-level", presentation.nDrcBoost);
-                            notify->setInt32("aac-drc-heavy-compression",
-                                             presentation.nHeavyCompression);
-                            notify->setInt32("aac-target-ref-level",
-                                             presentation.nTargetReferenceLevel);
-                            notify->setInt32("aac-drc-effect-type", presentation.nDrcEffectType);
-                            notify->setInt32("aac-drc-album-mode", presentation.nDrcAlbumMode);
-                            notify->setInt32("aac-drc-output-loudness",
-                                             presentation.nDrcOutputLoudness);
                         }
                     }
                     break;
@@ -5750,7 +5786,8 @@ status_t ACodec::requestIDRFrame() {
 
 ACodec::BaseState::BaseState(ACodec *codec, const sp<AState> &parentState)
     : AState(parentState),
-      mCodec(codec) {
+      mCodec(codec),
+      mPendingExtraOutputMetadataBufferRequest(false) {
 }
 
 ACodec::BaseState::PortMode ACodec::BaseState::getPortMode(
@@ -5848,6 +5885,21 @@ bool ACodec::BaseState::onMessageReceived(const sp<AMessage> &msg) {
 
         case kWhatCheckIfStuck: {
             ALOGV("No-op by default");
+            break;
+        }
+
+        case kWhatSubmitExtraOutputMetadataBuffer: {
+            mPendingExtraOutputMetadataBufferRequest = false;
+            if (getPortMode(kPortIndexOutput) == RESUBMIT_BUFFERS && mCodec->mIsLowLatency) {
+                // Decoders often need more than one output buffer to be
+                // submitted before processing a single input buffer.
+                // For low latency codecs, we don't want to wait for more input
+                // to be queued to get those output buffers submitted.
+                if (mCodec->submitOutputMetadataBuffer() == OK
+                        && mCodec->mMetadataBuffersToSubmit > 0) {
+                    maybePostExtraOutputMetadataBufferRequest();
+                }
+            }
             break;
         }
 
@@ -6207,7 +6259,12 @@ void ACodec::BaseState::onInputBufferFilled(const sp<AMessage> &msg) {
                             (outputMode == FREE_BUFFERS ? "FREE" :
                              outputMode == KEEP_BUFFERS ? "KEEP" : "RESUBMIT"));
                     if (outputMode == RESUBMIT_BUFFERS) {
-                        mCodec->submitOutputMetadataBuffer();
+                        status_t err = mCodec->submitOutputMetadataBuffer();
+                        if (mCodec->mIsLowLatency
+                                && err == OK
+                                && mCodec->mMetadataBuffersToSubmit > 0) {
+                            maybePostExtraOutputMetadataBufferRequest();
+                        }
                     }
                 }
                 info->checkReadFence("onInputBufferFilled");
@@ -7353,6 +7410,9 @@ void ACodec::ExecutingState::submitOutputMetaBuffers() {
                 break;
         }
     }
+    if (mCodec->mIsLowLatency) {
+        maybePostExtraOutputMetadataBufferRequest();
+    }
 
     // *** NOTE: THE FOLLOWING WORKAROUND WILL BE REMOVED ***
     mCodec->signalSubmitOutputMetadataBufferIfEOS_workaround();
@@ -7996,6 +8056,7 @@ status_t ACodec::setVendorParameters(const sp<AMessage> &params) {
     // don't bother component if we don't have vendor extensions as they may not have implemented
     // the android vendor extension support, which will lead to unnecessary OMX failure logs.
     if (vendorKeys.empty()) {
+        mVendorExtensionsStatus = kExtensionsNone;
         return OK;
     }
 
@@ -8287,13 +8348,34 @@ bool ACodec::OutputPortSettingsChangedState::onMessageReceived(
             FALLTHROUGH_INTENDED;
         }
         case kWhatResume:
-        case kWhatSetParameters:
         {
-            if (msg->what() == kWhatResume) {
-                ALOGV("[%s] Deferring resume", mCodec->mComponentName.c_str());
-            }
+            ALOGV("[%s] Deferring resume", mCodec->mComponentName.c_str());
 
             mCodec->deferMessage(msg);
+            handled = true;
+            break;
+        }
+
+        case kWhatSetParameters:
+        {
+            sp<AMessage> params;
+            CHECK(msg->findMessage("params", &params));
+
+            sp<ABuffer> hdr10PlusInfo;
+            if (params->findBuffer("hdr10-plus-info", &hdr10PlusInfo)) {
+                if (hdr10PlusInfo != nullptr && hdr10PlusInfo->size() > 0) {
+                    (void)mCodec->setHdr10PlusInfo(hdr10PlusInfo);
+                }
+                params->removeEntryAt(params->findEntryByName("hdr10-plus-info"));
+
+                if (params->countEntries() == 0) {
+                    msg->removeEntryAt(msg->findEntryByName("params"));
+                }
+            }
+
+            if (msg->countEntries() > 0) {
+                mCodec->deferMessage(msg);
+            }
             handled = true;
             break;
         }
@@ -8406,6 +8488,15 @@ bool ACodec::OutputPortSettingsChangedState::onOMXEvent(
             }
 
             return false;
+        }
+
+        case OMX_EventConfigUpdate:
+        {
+            CHECK_EQ(data1, (OMX_U32)kPortIndexOutput);
+
+            mCodec->onConfigUpdate((OMX_INDEXTYPE)data2);
+
+            return true;
         }
 
         default:

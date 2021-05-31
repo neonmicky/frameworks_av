@@ -453,7 +453,11 @@ OMXNodeInstance::OMXNodeInstance(
     mGraphicBufferEnabled[0] = false;
     mGraphicBufferEnabled[1] = false;
     mIsSecure = AString(name).endsWith(".secure");
+#ifdef QCOM_BSP_LEGACY
+    mLegacyAdaptiveExperiment = true;
+#else
     mLegacyAdaptiveExperiment = ADebug::isExperimentEnabled("legacy-adaptive");
+#endif
 }
 
 OMXNodeInstance::~OMXNodeInstance() {
@@ -578,6 +582,10 @@ status_t OMXNodeInstance::freeNode() {
         default:
             LOG_ALWAYS_FATAL("unknown state %s(%#x).", asString(state), state);
             break;
+    }
+
+    if (mActiveBuffers.size() > 0) {
+        freeActiveBuffers();
     }
 
     Mutex::Autolock _l(mLock);
